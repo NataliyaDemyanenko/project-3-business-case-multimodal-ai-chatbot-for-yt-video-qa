@@ -12,6 +12,9 @@ from tqdm import tqdm
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import traceback
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -120,21 +123,39 @@ def preprocess_video(video_id):
         print(f"Error in preprocess_video: {str(e)}")
         raise
 
+def get_most_relevant_context(question, contexts, top_n=2):
+    texts = [question] + contexts
+    vectorizer = TfidfVectorizer(stop_words='english')
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    cosine_similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
+    top_indices = np.argsort(cosine_similarities)[-top_n:][::-1]
+    return [contexts[i] for i in top_indices if cosine_similarities[i] > 0.1]
+
 def generate_answer(question, context):
-    input_text = f"question: {question} context: {context}"
+    input_text = f"Based on the following context, provide a concise and factual answer to the question. If the context doesn't contain relevant information, say so. Do not invent information.\n\nContext: {context}\n\nQuestion: {question}\nAnswer:"
     inputs = tokenizer([input_text], max_length=1024, return_tensors="pt", truncation=True)
     
     with torch.no_grad():
-        outputs = model.generate(inputs.input_ids, max_length=150, min_length=40, do_sample=True, top_p=0.95, top_k=50)
+        outputs = model.generate(
+            inputs.input_ids, 
+            max_length=200,  # Increased from 100
+            min_length=30, 
+            do_sample=True, 
+            top_p=0.95, 
+            top_k=50, 
+            num_return_sequences=3,
+            eos_token_id=tokenizer.eos_token_id,  # Ensure generation stops at the end of sentence
+            pad_token_id=tokenizer.pad_token_id,  # Proper padding
+        )
     
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
+    answers = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
+    return max(answers, key=len)
 
-def filter_answer(answer, question):
-    # Remove answers that are too short or just repetitions of the question
-    if len(answer) < 10 or answer.lower() in question.lower():
-        return None
-    return answer
+def answer_is_relevant(answer, context, question):
+    answer_words = set(answer.lower().split())
+    context_words = set(context.lower().split())
+    question_words = set(question.lower().split())
+    return len(answer_words & context_words) > 0 and len(answer_words & question_words) > 0
 
 @app.route('/')
 def index():
@@ -201,30 +222,35 @@ def chat():
     user_message = request.json['message']
     
     try:
-        # Query Pinecone to get relevant context
         query_embedding = retriever.encode([user_message]).tolist()
-        query_response = pinecone_index.query(vector=query_embedding[0], top_k=3, include_metadata=True)
+        query_response = pinecone_index.query(vector=query_embedding[0], top_k=5, include_metadata=True)
         
         if query_response['matches']:
             contexts = [match['metadata']['chunk_text'] for match in query_response['matches']]
-            combined_context = " ".join(contexts)
+            most_relevant_contexts = get_most_relevant_context(user_message, contexts)
             
-            # Generate answer using the model
+            if not most_relevant_contexts:
+                return jsonify({"response": "I couldn't find relevant information in the video to answer that question."})
+            
+            combined_context = " ".join(most_relevant_contexts)
+            
             answer = generate_answer(user_message, combined_context)
             
-            # Filter the answer
-            filtered_answer = filter_answer(answer, user_message)
-            
-            if filtered_answer:
-                print(f"Generated answer: {filtered_answer}")
-                return jsonify({"response": filtered_answer})
+            if answer_is_relevant(answer, combined_context, user_message):
+                print(f"Generated answer: {answer}")
+                return jsonify({
+                    "response": answer,
+                    "context": combined_context[:500] + "..." if len(combined_context) > 500 else combined_context
+                })
             else:
-                print("No suitable answer generated")
-                most_relevant_chunk = query_response['matches'][0]['metadata']['chunk_text']
-                return jsonify({"response": f"I couldn't generate a specific answer, but here's the most relevant information I found: {most_relevant_chunk}"})
+                print("Generated answer not relevant, falling back to context")
+                return jsonify({
+                    "response": f"Based on the video, the most relevant information I found is: {combined_context[:500]}...",
+                    "context": combined_context[:500] + "..." if len(combined_context) > 500 else combined_context
+                })
         else:
             print("No matches found in Pinecone index")
-            return jsonify({"response": "I'm sorry, I couldn't find relevant information to answer your question."})
+            return jsonify({"response": "I'm sorry, I couldn't find relevant information in the video to answer your question."})
     
     except Exception as e:
         error_traceback = traceback.format_exc()
