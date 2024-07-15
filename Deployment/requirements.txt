@@ -1,0 +1,12 @@
+flask
+python-dotenv
+yt-dlp
+youtube_transcript_api
+langchain
+pandas
+tqdm
+sentence-transformers
+pinecone-client
+torch
+transformers
+peft
