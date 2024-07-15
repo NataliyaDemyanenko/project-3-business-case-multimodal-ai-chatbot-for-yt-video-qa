@@ -141,7 +141,17 @@ def generate_answer(question, context):
     
     answer_start = torch.argmax(outputs.start_logits)
     answer_end = torch.argmax(outputs.end_logits) + 1
+    
+    if answer_start >= answer_end:
+        return "I couldn't find a specific answer to that question in the given context."
+    
     answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(inputs["input_ids"][0][answer_start:answer_end]))
+    
+    # Remove [CLS], [SEP], and special tokens
+    answer = answer.replace("[CLS]", "").replace("[SEP]", "").strip()
+    
+    if not answer:
+        return "I couldn't find a specific answer to that question in the given context."
     
     return answer
 
@@ -208,12 +218,19 @@ def chat():
         
         if query_response['matches']:
             context = query_response['matches'][0]['metadata']['chunk_text']
+            print(f"Found context: {context[:100]}...")  # Print first 100 characters of context
             
             # Generate answer using the model
             answer = generate_answer(user_message, context)
             
+            if answer.strip() == "[CLS]" or not answer.strip():
+                print("Model returned empty or [CLS] answer")
+                return jsonify({"response": "I'm sorry, I couldn't generate a relevant answer based on the available information."})
+            
+            print(f"Generated answer: {answer}")
             return jsonify({"response": answer})
         else:
+            print("No matches found in Pinecone index")
             return jsonify({"response": "I'm sorry, I couldn't find relevant information to answer your question."})
     
     except Exception as e:
