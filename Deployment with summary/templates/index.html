@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Video Chatbot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #video-input, #video-info, #chat-container {
+            margin-bottom: 20px;
+        }
+        #video-url {
+            width: 70%;
+            padding: 10px;
+        }
+        #process-btn {
+            padding: 10px 20px;
+        }
+        #chat-messages {
+            height: 300px;
+            border: 1px solid #ccc;
+            overflow-y: auto;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        #user-input {
+            width: 70%;
+            padding: 10px;
+        }
+        #send-btn {
+            padding: 10px 20px;
+        }
+        .message {
+            margin-bottom: 10px;
+        }
+        .user-message {
+            text-align: right;
+            color: blue;
+        }
+        .bot-message {
+            text-align: left;
+            color: green;
+        }
+    </style>
+</head>
+<body>
+    <h1>YouTube Video Chatbot</h1>
+    
+    <div id="video-input">
+        <input type="text" id="video-url" placeholder="Enter YouTube video URL">
+        <button id="process-btn">Process Video</button>
+    </div>
+    
+    <div id="video-info" style="display:none;">
+        <h2 id="video-title"></h2>
+        <p><strong>Channel:</strong> <span id="video-channel"></span></p>
+        <p><strong>Duration:</strong> <span id="video-duration"></span></p>
+        <p><strong>Description:</strong></p>
+        <p id="video-description"></p>
+    </div>
+    
+    <div id="chat-container" style="display:none;">
+        <div id="chat-messages"></div>
+        <input type="text" id="user-input" placeholder="Type your message...">
+        <button id="send-btn">Send</button>
+    </div>
+
+    <script>
+        const processBtn = document.getElementById('process-btn');
+        const videoUrl = document.getElementById('video-url');
+        const videoInfo = document.getElementById('video-info');
+        const videoTitle = document.getElementById('video-title');
+        const videoChannel = document.getElementById('video-channel');
+        const videoDuration = document.getElementById('video-duration');
+        const videoDescription = document.getElementById('video-description');
+        const chatContainer = document.getElementById('chat-container');
+        const chatMessages = document.getElementById('chat-messages');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+
+        function formatDuration(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const remainingSeconds = seconds % 60;
+            return `${hours}:${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+        }
+
+        processBtn.addEventListener('click', () => {
+            const url = videoUrl.value.trim();
+            if (url) {
+                fetch('/process_video', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ video_url: url }),
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                    } else {
+                        videoTitle.textContent = data.title;
+                        videoChannel.textContent = data.channel;
+                        videoDuration.textContent = formatDuration(data.duration);
+                        videoDescription.textContent = data.description;
+                        videoInfo.style.display = 'block';
+                        chatContainer.style.display = 'block';
+                        alert('Video processed successfully!');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('An error occurred while processing the video.');
+                });
+            } else {
+                alert('Please enter a valid YouTube URL');
+            }
+        });
+
+        sendBtn.addEventListener('click', sendMessage);
+        userInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        function sendMessage() {
+            const message = userInput.value.trim();
+            if (message) {
+                addMessage('user', message);
+                userInput.value = '';
+                
+                fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ message: message }),
+                })
+                .then(response => response.json())
+                .then(data => {
+                    addMessage('bot', data.response);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    addMessage('bot', 'Sorry, an error occurred.');
+                });
+            }
+        }
+
+        function addMessage(sender, message) {
+            const messageElement = document.createElement('div');
+            messageElement.classList.add('message', sender + '-message');
+            messageElement.textContent = message;
+            chatMessages.appendChild(messageElement);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    </script>
+</body>
+</html>
