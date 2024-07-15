@@ -1,4 +1,5 @@
 import os
+import time
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template
 import yt_dlp
@@ -9,7 +10,7 @@ from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import traceback
 
 # Load environment variables
@@ -17,62 +18,47 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Initialize Pinecone
-pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-
-# Define the index name
-index_name = 'question-answering'
-
-# Check if the index exists, if not, create it
-if index_name not in pc.list_indexes().names():
-    pc.create_index(
-        name=index_name,
-        dimension=768,  # This should match the dimension of your embeddings
-        metric='cosine',
-        spec=ServerlessSpec(
-            cloud='aws',
-            region='us-west-2'  # Change this to your preferred region
-        )
-    )
-
-# Connect to the index
-index = pc.Index(index_name)
-
-# Test the index connection
-try:
-    stats = index.describe_index_stats()
-    print(f"Successfully connected to Pinecone index. Total vectors: {stats['total_vector_count']}")
-except Exception as e:
-    print(f"Error connecting to Pinecone index: {str(e)}")
-    raise
-
-# Global variable to store the index
-pinecone_index = index
+# Global variables
+pc = None
+pinecone_index = None
+index_name = 'question-answering'  # Use a fixed name
 
 # Initialize SentenceTransformer
 retriever = SentenceTransformer('flax-sentence-embeddings/all_datasets_v3_mpnet-base')
 
-# Define the path to your local model (if you have one)
-LOCAL_MODEL_PATH = "./fine_tuned_model"
+# Define a Hugging Face model to use
+HF_MODEL_NAME = "vblagoje/bart_lfqa"
 
-# Define a Hugging Face model to use (you can change this to any model you prefer)
-HF_MODEL_NAME = "distilbert-base-cased-distilled-squad"
+def initialize_pinecone():
+    global pc, pinecone_index, index_name
+    
+    # Initialize Pinecone
+    pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+    
+    # Check if the index already exists
+    if index_name not in pc.list_indexes().names():
+        # Create a new index if it doesn't exist
+        pc.create_index(
+            name=index_name,
+            dimension=768,  # This should match the dimension of your embeddings
+            metric='cosine',
+            spec=ServerlessSpec(
+                cloud='gcp',
+                region='us-central1'  # This is the region for the gcp-starter environment
+            )
+        )
+    
+    # Connect to the index
+    pinecone_index = pc.Index(index_name)
+    
+    print(f"Connected to Pinecone index: {index_name}")
+
+# Call this function at the start of your application
+initialize_pinecone()
 
 def load_model():
-    # Check if we have a local model
-    if os.path.exists(LOCAL_MODEL_PATH):
-        try:
-            print(f"Attempting to load model from {LOCAL_MODEL_PATH}")
-            model = AutoModelForQuestionAnswering.from_pretrained(LOCAL_MODEL_PATH)
-            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
-            print("Successfully loaded local model")
-            return model, tokenizer
-        except Exception as e:
-            print(f"Error loading local model: {str(e)}")
-    
-    # If no local model or loading failed, use the Hugging Face model
     print(f"Loading model from Hugging Face: {HF_MODEL_NAME}")
-    model = AutoModelForQuestionAnswering.from_pretrained(HF_MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(HF_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
     print("Successfully loaded Hugging Face model")
     return model, tokenizer
@@ -135,24 +121,19 @@ def preprocess_video(video_id):
         raise
 
 def generate_answer(question, context):
-    inputs = tokenizer(question, context, return_tensors="pt", max_length=512, truncation=True, padding="max_length")
+    input_text = f"question: {question} context: {context}"
+    inputs = tokenizer([input_text], max_length=1024, return_tensors="pt", truncation=True)
+    
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = model.generate(inputs.input_ids, max_length=150, min_length=40, do_sample=True, top_p=0.95, top_k=50)
     
-    answer_start = torch.argmax(outputs.start_logits)
-    answer_end = torch.argmax(outputs.end_logits) + 1
-    
-    if answer_start >= answer_end:
-        return "I couldn't find a specific answer to that question in the given context."
-    
-    answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(inputs["input_ids"][0][answer_start:answer_end]))
-    
-    # Remove [CLS], [SEP], and special tokens
-    answer = answer.replace("[CLS]", "").replace("[SEP]", "").strip()
-    
-    if not answer:
-        return "I couldn't find a specific answer to that question in the given context."
-    
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer
+
+def filter_answer(answer, question):
+    # Remove answers that are too short or just repetitions of the question
+    if len(answer) < 10 or answer.lower() in question.lower():
+        return None
     return answer
 
 @app.route('/')
@@ -161,20 +142,25 @@ def index():
 
 @app.route('/process_video', methods=['POST'])
 def process_video():
+    global pinecone_index
+    
     video_url = request.json['video_url']
     try:
-        video_id = video_url.split('v=')[1].split('&')[0]  # This will handle URLs with additional parameters
+        video_id = video_url.split('v=')[1].split('&')[0]
     except IndexError:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
     try:
+        # Clear existing vectors
+        pinecone_index.delete(delete_all=True)
+        
         # Process the video
         video_data, video_info = preprocess_video(video_id)
         
         # Convert to DataFrame
         df = pd.DataFrame(video_data)
         
-        # Upsert to Pinecone
+        # Upsert to the Pinecone index
         batch_size = 100
         for i in tqdm(range(0, len(df), batch_size)):
             i_end = min(i + batch_size, len(df))
@@ -198,7 +184,8 @@ def process_video():
             "title": video_info['title'],
             "channel": video_info['uploader'],
             "description": video_info['description'],
-            "duration": video_info['duration']
+            "duration": video_info['duration'],
+            "index_name": index_name
         })
     
     except Exception as e:
@@ -209,26 +196,32 @@ def process_video():
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    global pinecone_index
+    
     user_message = request.json['message']
     
     try:
         # Query Pinecone to get relevant context
         query_embedding = retriever.encode([user_message]).tolist()
-        query_response = pinecone_index.query(vector=query_embedding[0], top_k=1, include_metadata=True)
+        query_response = pinecone_index.query(vector=query_embedding[0], top_k=3, include_metadata=True)
         
         if query_response['matches']:
-            context = query_response['matches'][0]['metadata']['chunk_text']
-            print(f"Found context: {context[:100]}...")  # Print first 100 characters of context
+            contexts = [match['metadata']['chunk_text'] for match in query_response['matches']]
+            combined_context = " ".join(contexts)
             
             # Generate answer using the model
-            answer = generate_answer(user_message, context)
+            answer = generate_answer(user_message, combined_context)
             
-            if answer.strip() == "[CLS]" or not answer.strip():
-                print("Model returned empty or [CLS] answer")
-                return jsonify({"response": "I'm sorry, I couldn't generate a relevant answer based on the available information."})
+            # Filter the answer
+            filtered_answer = filter_answer(answer, user_message)
             
-            print(f"Generated answer: {answer}")
-            return jsonify({"response": answer})
+            if filtered_answer:
+                print(f"Generated answer: {filtered_answer}")
+                return jsonify({"response": filtered_answer})
+            else:
+                print("No suitable answer generated")
+                most_relevant_chunk = query_response['matches'][0]['metadata']['chunk_text']
+                return jsonify({"response": f"I couldn't generate a specific answer, but here's the most relevant information I found: {most_relevant_chunk}"})
         else:
             print("No matches found in Pinecone index")
             return jsonify({"response": "I'm sorry, I couldn't find relevant information to answer your question."})
