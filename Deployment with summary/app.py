@@ -15,6 +15,14 @@ import traceback
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+from langchain.memory import ConversationBufferWindowMemory
+from langchain.chains import ConversationChain, LLMChain
+from langchain_huggingface import HuggingFacePipeline
+from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent, AgentOutputParser
+from langchain.schema import AgentAction, AgentFinish
+from langchain.prompts import StringPromptTemplate
+from typing import List, Union
+import re
 
 # Load environment variables
 load_dotenv()
@@ -33,7 +41,7 @@ retriever = SentenceTransformer('flax-sentence-embeddings/all_datasets_v3_mpnet-
 HF_MODEL_NAME = "vblagoje/bart_lfqa"
 
 # Initialize summarization pipeline
-summarizer = pipeline("summarization", model="facebook/bart-base")
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 
 def initialize_pinecone():
     global pc, pinecone_index, index_name
@@ -71,6 +79,19 @@ def load_model():
 
 # Load the model
 model, tokenizer = load_model()
+
+# Create a HuggingFacePipeline
+local_llm = HuggingFacePipeline(pipeline=pipeline("text2text-generation", model=model, tokenizer=tokenizer))
+
+# Initialize the memory
+memory = ConversationBufferWindowMemory(k=3)
+
+# Create the conversation chain
+conversation = ConversationChain(
+    llm=local_llm,
+    memory=memory,
+    verbose=True
+)
 
 def preprocess_video(video_id):
     print(f"Starting to preprocess video: {video_id}")
@@ -192,7 +213,124 @@ def create_summary(text):
         final_summary = combined_summary
     
     return final_summary
+
+def get_context(question):
+    global pinecone_index
+    query_embedding = retriever.encode([question]).tolist()
+    query_response = pinecone_index.query(vector=query_embedding[0], top_k=5, include_metadata=True)
     
+    if query_response['matches']:
+        contexts = [match['metadata']['chunk_text'] for match in query_response['matches']]
+        return get_most_relevant_context(question, contexts)
+    return []
+
+def summarize_video():
+    global pinecone_index
+    
+    try:
+        query_response = pinecone_index.query(
+            vector=[0]*768,  # Dummy vector
+            top_k=10000,  # Retrieve all vectors
+            include_metadata=True
+        )
+        
+        if query_response['matches']:
+            all_text = " ".join([match['metadata']['chunk_text'] for match in query_response['matches'] if 'chunk_text' in match['metadata']])
+            
+            if not all_text:
+                return "I don't have enough information to summarize the video content."
+            
+            summary = create_summary(all_text)
+            return f"Here's a summary of the video: {summary}"
+        else:
+            return "I don't have enough information to summarize the video content."
+    
+    except Exception as e:
+        print(f"Error in summarize_video: {str(e)}")
+        return "An error occurred while trying to summarize the video."
+
+# Define the tools
+tools = [
+    Tool(
+        name="Question Answering",
+        func=lambda x: generate_answer(x, get_context(x)),
+        description="Useful for answering questions about the video content"
+    ),
+    Tool(
+        name="Summarization",
+        func=summarize_video,
+        description="Useful for summarizing the entire video content"
+    )
+]
+
+# Define the prompt template
+class CustomPromptTemplate(StringPromptTemplate):
+    template: str
+    tools: List[Tool]
+
+    def format(self, **kwargs) -> str:
+        intermediate_steps = kwargs.pop("intermediate_steps")
+        thoughts = ""
+        for action, observation in intermediate_steps:
+            thoughts += action.log
+            thoughts += f"\nObservation: {observation}\nThought: "
+        kwargs["agent_scratchpad"] = thoughts
+        kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
+        kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
+        return self.template.format(**kwargs)
+
+prompt = CustomPromptTemplate(
+    template="""Answer the following question as best you can. You have access to the following tools:
+
+{tools}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {input}
+Thought: {agent_scratchpad}""",
+    tools=tools,
+    input_variables=["input", "intermediate_steps"]
+)
+
+# Define the output parser
+class CustomOutputParser(AgentOutputParser):
+    def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
+        if "Final Answer:" in llm_output:
+            return AgentFinish(
+                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
+                log=llm_output,
+            )
+        match = re.match(r"Action: (.*?)\nAction Input: (.*)", llm_output, re.DOTALL)
+        if not match:
+            raise ValueError(f"Could not parse LLM output: `{llm_output}`")
+        action = match.group(1).strip()
+        action_input = match.group(2)
+        return AgentAction(tool=action, tool_input=action_input.strip(" ").strip('"'), log=llm_output)
+
+output_parser = CustomOutputParser()
+
+# Define the agent
+agent = LLMSingleActionAgent(
+    llm_chain=LLMChain(llm=local_llm, prompt=prompt),
+    output_parser=output_parser,
+    stop=["\nObservation:"],
+    allowed_tools=[tool.name for tool in tools]
+)
+
+# Create the agent executor
+agent_executor = AgentExecutor.from_agent_and_tools(agent=agent, tools=tools, verbose=True)
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -209,7 +347,11 @@ def process_video():
     
     try:
         # Clear existing vectors
-        pinecone_index.delete(delete_all=True)
+        try:
+            pinecone_index.delete(delete_all=True)
+        except Exception as e:
+            print(f"Warning: Could not delete existing vectors: {str(e)}")
+            # Continue with the process even if deletion fails
         
         # Process the video
         video_data, video_info = preprocess_video(video_id)
@@ -256,8 +398,7 @@ def process_video():
         error_traceback = traceback.format_exc()
         print(f"Error processing video: {str(e)}")
         print(f"Traceback: {error_traceback}")
-        return jsonify({"error": str(e), "traceback": error_traceback}), 400
-
+        return jsonify({"error": str(e), "traceback": error_traceback}), 500
 
 @app.route('/chat', methods=['POST'])
 def chat():
