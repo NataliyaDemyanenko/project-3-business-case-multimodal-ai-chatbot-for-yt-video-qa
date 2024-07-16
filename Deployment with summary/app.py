@@ -1,5 +1,4 @@
 import os
-import time
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template
 import yt_dlp
@@ -10,88 +9,76 @@ from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 import traceback
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.chains import ConversationChain, LLMChain
-from langchain_huggingface import HuggingFacePipeline
-from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent, AgentOutputParser
-from langchain.schema import AgentAction, AgentFinish
-from langchain.prompts import StringPromptTemplate
-from typing import List, Union
-import re
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 
-# Global variables
-pc = None
-pinecone_index = None
-index_name = 'question-answering'  # Use a fixed name
+# Initialize Pinecone
+pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+
+# Define the index name
+index_name = 'question-answering'
+
+# Check if the index exists, if not, create it
+if index_name not in pc.list_indexes().names():
+    pc.create_index(
+        name=index_name,
+        dimension=768,  # This should match the dimension of your embeddings
+        metric='cosine',
+        spec=ServerlessSpec(
+            cloud='aws',
+            region='us-west-2'  # Change this to your preferred region
+        )
+    )
+
+# Connect to the index
+index = pc.Index(index_name)
+
+# Test the index connection
+try:
+    stats = index.describe_index_stats()
+    print(f"Successfully connected to Pinecone index. Total vectors: {stats['total_vector_count']}")
+except Exception as e:
+    print(f"Error connecting to Pinecone index: {str(e)}")
+    raise
+
+# Global variable to store the index
+pinecone_index = index
 
 # Initialize SentenceTransformer
 retriever = SentenceTransformer('flax-sentence-embeddings/all_datasets_v3_mpnet-base')
 
-# Define a Hugging Face model to use
-HF_MODEL_NAME = "vblagoje/bart_lfqa"
+# Define the path to your local model (if you have one)
+LOCAL_MODEL_PATH = "./fine_tuned_model"
 
-# Initialize summarization pipeline
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-
-def initialize_pinecone():
-    global pc, pinecone_index, index_name
-    
-    # Initialize Pinecone
-    pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-    
-    # Check if the index already exists
-    if index_name not in pc.list_indexes().names():
-        # Create a new index if it doesn't exist
-        pc.create_index(
-            name=index_name,
-            dimension=768,  # This should match the dimension of your embeddings
-            metric='cosine',
-            spec=ServerlessSpec(
-                cloud='gcp',
-                region='us-central1'  # This is the region for the gcp-starter environment
-            )
-        )
-    
-    # Connect to the index
-    pinecone_index = pc.Index(index_name)
-    
-    print(f"Connected to Pinecone index: {index_name}")
-
-# Call this function at the start of your application
-initialize_pinecone()
+# Define a Hugging Face model to use (you can change this to any model you prefer)
+HF_MODEL_NAME = "distilbert-base-cased-distilled-squad"
 
 def load_model():
+    # Check if we have a local model
+    if os.path.exists(LOCAL_MODEL_PATH):
+        try:
+            print(f"Attempting to load model from {LOCAL_MODEL_PATH}")
+            model = AutoModelForQuestionAnswering.from_pretrained(LOCAL_MODEL_PATH)
+            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
+            print("Successfully loaded local model")
+            return model, tokenizer
+        except Exception as e:
+            print(f"Error loading local model: {str(e)}")
+    
+    # If no local model or loading failed, use the Hugging Face model
     print(f"Loading model from Hugging Face: {HF_MODEL_NAME}")
-    model = AutoModelForSeq2SeqLM.from_pretrained(HF_MODEL_NAME)
+    model = AutoModelForQuestionAnswering.from_pretrained(HF_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
     print("Successfully loaded Hugging Face model")
     return model, tokenizer
 
 # Load the model
 model, tokenizer = load_model()
-
-# Create a HuggingFacePipeline
-local_llm = HuggingFacePipeline(pipeline=pipeline("text2text-generation", model=model, tokenizer=tokenizer))
-
-# Initialize the memory
-memory = ConversationBufferWindowMemory(k=3)
-
-# Create the conversation chain
-conversation = ConversationChain(
-    llm=local_llm,
-    memory=memory,
-    verbose=True
-)
 
 def preprocess_video(video_id):
     print(f"Starting to preprocess video: {video_id}")
@@ -147,189 +134,26 @@ def preprocess_video(video_id):
         print(f"Error in preprocess_video: {str(e)}")
         raise
 
-def get_most_relevant_context(question, contexts, top_n=3):
-    texts = [question] + contexts
-    vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    cosine_similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-    top_indices = np.argsort(cosine_similarities)[-top_n:][::-1]
-    relevant_contexts = [contexts[i] for i in top_indices if cosine_similarities[i] > 0.2]  # Increased threshold
-    return relevant_contexts
-
 def generate_answer(question, context):
-    input_text = f"Based on the following context, provide a concise and relevant answer to the question. If the context doesn't contain relevant information, say 'I don't have enough information to answer that question based on the video content.'\n\nContext: {context}\n\nQuestion: {question}\nAnswer:"
-    inputs = tokenizer([input_text], max_length=1024, return_tensors="pt", truncation=True)
-    
+    inputs = tokenizer(question, context, return_tensors="pt", max_length=512, truncation=True, padding="max_length")
     with torch.no_grad():
-        outputs = model.generate(
-            inputs.input_ids, 
-            max_length=150,  # Reduced max_length for more concise answers
-            min_length=20, 
-            do_sample=True, 
-            top_p=0.95, 
-            top_k=50, 
-            num_return_sequences=1,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        outputs = model(**inputs)
     
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    answer_start = torch.argmax(outputs.start_logits)
+    answer_end = torch.argmax(outputs.end_logits) + 1
+    
+    if answer_start >= answer_end:
+        return "I couldn't find a specific answer to that question in the given context."
+    
+    answer = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(inputs["input_ids"][0][answer_start:answer_end]))
+    
+    # Remove [CLS], [SEP], and special tokens
+    answer = answer.replace("[CLS]", "").replace("[SEP]", "").strip()
+    
+    if not answer:
+        return "I couldn't find a specific answer to that question in the given context."
+    
     return answer
-
-def chunk_text(text, chunk_size=1000):
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size):
-        chunks.append(' '.join(words[i:i+chunk_size]))
-    return chunks
-
-def create_summary(text):
-    if not text:
-        return "No text available to summarize."
-    
-    chunks = chunk_text(text)
-    summaries = []
-    
-    for chunk in chunks:
-        try:
-            summary = summarizer(chunk, max_length=150, min_length=50, do_sample=False)[0]['summary_text']
-            summaries.append(summary)
-        except Exception as e:
-            print(f"Error summarizing chunk: {str(e)}")
-            continue
-    
-    if not summaries:
-        return "Unable to generate a summary."
-    
-    combined_summary = ' '.join(summaries)
-    
-    if len(combined_summary.split()) > 200:
-        try:
-            final_summary = summarizer(combined_summary, max_length=200, min_length=100, do_sample=False)[0]['summary_text']
-        except Exception as e:
-            print(f"Error in final summarization: {str(e)}")
-            final_summary = combined_summary[:200] + "..."
-    else:
-        final_summary = combined_summary
-    
-    return final_summary
-
-def get_context(question):
-    global pinecone_index
-    query_embedding = retriever.encode([question]).tolist()
-    query_response = pinecone_index.query(vector=query_embedding[0], top_k=5, include_metadata=True)
-    
-    if query_response['matches']:
-        contexts = [match['metadata']['chunk_text'] for match in query_response['matches']]
-        return get_most_relevant_context(question, contexts)
-    return []
-
-def summarize_video():
-    global pinecone_index
-    
-    try:
-        query_response = pinecone_index.query(
-            vector=[0]*768,  # Dummy vector
-            top_k=10000,  # Retrieve all vectors
-            include_metadata=True
-        )
-        
-        if query_response['matches']:
-            all_text = " ".join([match['metadata']['chunk_text'] for match in query_response['matches'] if 'chunk_text' in match['metadata']])
-            
-            if not all_text:
-                return "I don't have enough information to summarize the video content."
-            
-            summary = create_summary(all_text)
-            return f"Here's a summary of the video: {summary}"
-        else:
-            return "I don't have enough information to summarize the video content."
-    
-    except Exception as e:
-        print(f"Error in summarize_video: {str(e)}")
-        return "An error occurred while trying to summarize the video."
-
-# Define the tools
-tools = [
-    Tool(
-        name="Question Answering",
-        func=lambda x: generate_answer(x, get_context(x)),
-        description="Useful for answering questions about the video content"
-    ),
-    Tool(
-        name="Summarization",
-        func=summarize_video,
-        description="Useful for summarizing the entire video content"
-    )
-]
-
-# Define the prompt template
-class CustomPromptTemplate(StringPromptTemplate):
-    template: str
-    tools: List[Tool]
-
-    def format(self, **kwargs) -> str:
-        intermediate_steps = kwargs.pop("intermediate_steps")
-        thoughts = ""
-        for action, observation in intermediate_steps:
-            thoughts += action.log
-            thoughts += f"\nObservation: {observation}\nThought: "
-        kwargs["agent_scratchpad"] = thoughts
-        kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
-        kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
-        return self.template.format(**kwargs)
-
-prompt = CustomPromptTemplate(
-    template="""Answer the following question as best you can. You have access to the following tools:
-
-{tools}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Begin!
-
-Question: {input}
-Thought: {agent_scratchpad}""",
-    tools=tools,
-    input_variables=["input", "intermediate_steps"]
-)
-
-# Define the output parser
-class CustomOutputParser(AgentOutputParser):
-    def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
-        if "Final Answer:" in llm_output:
-            return AgentFinish(
-                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
-                log=llm_output,
-            )
-        match = re.match(r"Action: (.*?)\nAction Input: (.*)", llm_output, re.DOTALL)
-        if not match:
-            raise ValueError(f"Could not parse LLM output: `{llm_output}`")
-        action = match.group(1).strip()
-        action_input = match.group(2)
-        return AgentAction(tool=action, tool_input=action_input.strip(" ").strip('"'), log=llm_output)
-
-output_parser = CustomOutputParser()
-
-# Define the agent
-agent = LLMSingleActionAgent(
-    llm_chain=LLMChain(llm=local_llm, prompt=prompt),
-    output_parser=output_parser,
-    stop=["\nObservation:"],
-    allowed_tools=[tool.name for tool in tools]
-)
-
-# Create the agent executor
-agent_executor = AgentExecutor.from_agent_and_tools(agent=agent, tools=tools, verbose=True)
 
 @app.route('/')
 def index():
@@ -337,32 +161,20 @@ def index():
 
 @app.route('/process_video', methods=['POST'])
 def process_video():
-    global pinecone_index
-    
     video_url = request.json['video_url']
     try:
-        video_id = video_url.split('v=')[1].split('&')[0]
+        video_id = video_url.split('v=')[1].split('&')[0]  # This will handle URLs with additional parameters
     except IndexError:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
     try:
-        # Clear existing vectors
-        try:
-            pinecone_index.delete(delete_all=True)
-        except Exception as e:
-            print(f"Warning: Could not delete existing vectors: {str(e)}")
-            # Continue with the process even if deletion fails
-        
         # Process the video
         video_data, video_info = preprocess_video(video_id)
         
         # Convert to DataFrame
         df = pd.DataFrame(video_data)
         
-        # Store complete text
-        complete_text = " ".join(df['chunk_text'])
-        
-        # Upsert to the Pinecone index
+        # Upsert to Pinecone
         batch_size = 100
         for i in tqdm(range(0, len(df), batch_size)):
             i_end = min(i + batch_size, len(df))
@@ -380,100 +192,50 @@ def process_video():
                 print(f"Error during upsert: {str(e)}")
                 raise
         
-        # Store complete text as a separate vector
-        complete_text_embedding = retriever.encode([complete_text]).tolist()[0]
-        pinecone_index.upsert(vectors=[("complete_text", complete_text_embedding, {"chunk_text": complete_text})])
-        
         return jsonify({
             "message": "Video processed successfully",
             "video_id": video_id,
             "title": video_info['title'],
             "channel": video_info['uploader'],
             "description": video_info['description'],
-            "duration": video_info['duration'],
-            "index_name": index_name
+            "duration": video_info['duration']
         })
     
     except Exception as e:
         error_traceback = traceback.format_exc()
         print(f"Error processing video: {str(e)}")
         print(f"Traceback: {error_traceback}")
-        return jsonify({"error": str(e), "traceback": error_traceback}), 500
+        return jsonify({"error": str(e), "traceback": error_traceback}), 400
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    global pinecone_index
-    
-    user_message = request.json['message'].lower().strip()
+    user_message = request.json['message']
     
     try:
-        summary_requests = [
-            "summarize the video", "what is the video about", "what is the topic",
-            "give me a summary", "what's the main idea", "what's the video's content",
-            "provide an overview", "what are the key points"
-        ]
-        
-        if any(request in user_message for request in summary_requests):
-            return summarize_video()
-        
+        # Query Pinecone to get relevant context
         query_embedding = retriever.encode([user_message]).tolist()
-        query_response = pinecone_index.query(vector=query_embedding[0], top_k=5, include_metadata=True)
+        query_response = pinecone_index.query(vector=query_embedding[0], top_k=1, include_metadata=True)
         
         if query_response['matches']:
-            contexts = [match['metadata']['chunk_text'] for match in query_response['matches']]
-            most_relevant_contexts = get_most_relevant_context(user_message, contexts)
+            context = query_response['matches'][0]['metadata']['chunk_text']
+            print(f"Found context: {context[:100]}...")  # Print first 100 characters of context
             
-            if not most_relevant_contexts:
-                return jsonify({"response": "I don't have enough information to answer that question based on the video content."})
+            # Generate answer using the model
+            answer = generate_answer(user_message, context)
             
-            combined_context = " ".join(most_relevant_contexts)
+            if answer.strip() == "[CLS]" or not answer.strip():
+                print("Model returned empty or [CLS] answer")
+                return jsonify({"response": "I'm sorry, I couldn't generate a relevant answer based on the available information."})
             
-            answer = generate_answer(user_message, combined_context)
-            
-            return jsonify({
-                "response": answer,
-                "context": combined_context[:500] + "..." if len(combined_context) > 500 else combined_context
-            })
+            print(f"Generated answer: {answer}")
+            return jsonify({"response": answer})
         else:
-            return jsonify({"response": "I don't have enough information to answer that question based on the video content."})
+            print("No matches found in Pinecone index")
+            return jsonify({"response": "I'm sorry, I couldn't find relevant information to answer your question."})
     
     except Exception as e:
         error_traceback = traceback.format_exc()
         print(f"Error in chat: {str(e)}")
-        print(f"Traceback: {error_traceback}")
-        return jsonify({"error": str(e), "traceback": error_traceback}), 400
-
-def summarize_video():
-    global pinecone_index
-    
-    try:
-        # Retrieve all vectors from Pinecone
-        query_response = pinecone_index.query(
-            vector=[0]*768,  # Dummy vector
-            top_k=10000,  # Retrieve all vectors
-            include_metadata=True
-        )
-        
-        if query_response['matches']:
-            # Extract all text chunks
-            all_text = " ".join([match['metadata']['chunk_text'] for match in query_response['matches'] if 'chunk_text' in match['metadata']])
-            
-            if not all_text:
-                return jsonify({"response": "I don't have enough information to summarize the video content."})
-            
-            # Generate summary
-            try:
-                summary = create_summary(all_text)
-                return jsonify({"response": f"Here's a summary of the video: {summary}"})
-            except Exception as e:
-                print(f"Error in create_summary: {str(e)}")
-                return jsonify({"response": "I don't have enough information to summarize the video content."})
-        else:
-            return jsonify({"response": "I don't have enough information to summarize the video content."})
-    
-    except Exception as e:
-        error_traceback = traceback.format_exc()
-        print(f"Error in summarize_video: {str(e)}")
         print(f"Traceback: {error_traceback}")
         return jsonify({"error": str(e), "traceback": error_traceback}), 400
 
