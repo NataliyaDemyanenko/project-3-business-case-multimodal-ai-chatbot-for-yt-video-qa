@@ -1,7 +1,9 @@
 import os
 import time
+from functools import lru_cache
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template
+from langchain_community.llms import HuggingFacePipeline
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -10,16 +12,11 @@ from sentence_transformers import SentenceTransformer, util
 from pinecone import Pinecone, ServerlessSpec
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline, AutoConfig, AutoModelForSeq2SeqLM, BartForConditionalGeneration, BartTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline, AutoConfig, BartForConditionalGeneration, BartTokenizer
 import traceback
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-from langchain.memory import ConversationBufferMemory
-from langchain.llms import HuggingFacePipeline
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 import random
 from collections import Counter
 import re
@@ -29,9 +26,9 @@ from nltk.corpus import stopwords
 from nltk.tag import pos_tag
 from collections import OrderedDict
 
-nltk.download('punkt')
-nltk.download('stopwords')
-nltk.download('averaged_perceptron_tagger')
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
 
 # Load environment variables
 load_dotenv()
@@ -39,14 +36,6 @@ load_dotenv()
 app = Flask(__name__)
 
 current_video_id = None 
-
-# Initialize Pinecone
-pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-
-# Global variables
-#pc = None
-#pinecone_index = None
-index_name = 'question-answering'  # Use a fixed name
 
 # Initialize SentenceTransformer
 retriever = SentenceTransformer('flax-sentence-embeddings/all_datasets_v3_mpnet-base')
@@ -62,47 +51,57 @@ summarization_model = BartForConditionalGeneration.from_pretrained(summarization
 # Define the index name
 index_name = 'question-answering'
 
-# Check if the index exists, if not, create it
-if index_name not in pc.list_indexes().names():
-    pc.create_index(
-        name=index_name,
-        dimension=768,  # This should match the dimension of your embeddings
-        metric='cosine',
-        spec=ServerlessSpec(
-            cloud='aws',
-            region='us-west-2'  # Change this to your preferred region
-        )
-    )
+# Global variables for lazy loading
+model_instance = None
+tokenizer_instance = None
+pinecone_client = None
+pinecone_index = None
 
-# Connect to the index
-index = pc.Index(index_name)
+@lru_cache(maxsize=1)
+def get_pinecone_client():
+    global pinecone_client
+    if pinecone_client is None:
+        pinecone_client = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+    return pinecone_client
 
-# Test the index connection
-try:
-    stats = index.describe_index_stats()
-    print(f"Successfully connected to Pinecone index. Total vectors: {stats['total_vector_count']}")
-except Exception as e:
-    print(f"Error connecting to Pinecone index: {str(e)}")
-    raise
+@lru_cache(maxsize=1)
+def get_pinecone_index():
+    global pinecone_index
+    if pinecone_index is None:
+        client = get_pinecone_client()
+        if index_name not in client.list_indexes().names():
+            client.create_index(
+                name=index_name,
+                dimension=768,
+                metric='cosine',
+                spec=ServerlessSpec(
+                    cloud='aws',
+                    region='us-west-2'
+                )
+            )
+        pinecone_index = client.Index(index_name)
+    return pinecone_index
 
-# Global variable to store the index
-pinecone_index = index
+def unload_pinecone():
+    global pinecone_client, pinecone_index
+    pinecone_client = None
+    pinecone_index = None
+    get_pinecone_client.cache_clear()
+    get_pinecone_index.cache_clear()
 
-def load_model():
-    print(f"Loading model from Hugging Face: {HF_MODEL_NAME}")
-    model = AutoModelForSeq2SeqLM.from_pretrained(HF_MODEL_NAME)
-    tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
-    print("Successfully loaded Hugging Face model")
-    return model, tokenizer
+def get_model():
+    global model_instance, tokenizer_instance
+    if model_instance is None or tokenizer_instance is None:
+        print(f"Loading model from Hugging Face: {HF_MODEL_NAME}")
+        model_instance = AutoModelForSeq2SeqLM.from_pretrained(HF_MODEL_NAME)
+        tokenizer_instance = AutoTokenizer.from_pretrained(HF_MODEL_NAME)
+        print("Successfully loaded Hugging Face model")
+    return model_instance, tokenizer_instance
 
-# Load the model
-model, tokenizer = load_model()
-
-# Create a HuggingFacePipeline
-local_llm = HuggingFacePipeline(pipeline=pipeline("text2text-generation", model=model, tokenizer=tokenizer))
-
-# Initialize memory
-#memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+def unload_model():
+    global model_instance, tokenizer_instance
+    model_instance = None
+    tokenizer_instance = None
 
 def preprocess_video(video_id):
     print(f"Starting to preprocess video: {video_id}")
@@ -160,54 +159,42 @@ def preprocess_video(video_id):
         raise
 
 def get_most_relevant_context(question, contexts, top_n=2):
-    # TF-IDF
     vectorizer = TfidfVectorizer(stop_words='english')
     tfidf_matrix = vectorizer.fit_transform([question] + contexts)
     tfidf_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
     
-    # Semantic Similarity
     question_embedding = retriever.encode([question])
     context_embeddings = retriever.encode(contexts)
-    semantic_scores = util.pytorch_cos_sim(question_embedding, context_embeddings).cpu().numpy().flatten()
+    semantic_scores = util.pytorch_cos_sim(question_embedding, context_embeddings).numpy().flatten()
     
-    # Ensure both scores are NumPy arrays and have the same shape
     tfidf_scores = np.array(tfidf_scores)
     semantic_scores = np.array(semantic_scores)
     
-    # Combine scores
     combined_scores = 0.5 * tfidf_scores + 0.5 * semantic_scores
     
     top_indices = combined_scores.argsort()[-top_n:][::-1]
     return [contexts[i] for i in top_indices]
-    
+
 def remove_duplicates(text):
     sentences = sent_tokenize(text)
     unique_sentences = list(OrderedDict.fromkeys(sentences))
     return ' '.join(unique_sentences)
 
-import re
-
 def clean_and_format_sentence(sentence):
-    # Remove extra spaces and trailing commas, and [Music] tags
     sentence = re.sub(r'\s+', ' ', sentence).strip().rstrip(',')
     sentence = re.sub(r'\[Music\]', '', sentence)
     
-    # Ensure the sentence ends with proper punctuation
     if not sentence.endswith(('.', '?', '!')):
         sentence += '.'
 
-    # Capitalize the first letter
     if len(sentence) > 0:
         sentence = sentence[0].upper() + sentence[1:]
 
     return sentence
 
 def split_into_sentences(text):
-    # Use a regex to split text into sentences more accurately
     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
     cleaned_sentences = [clean_and_format_sentence(s) for s in sentences if len(s.strip()) > 10]
-    
-    # Ensure sentences are joined properly without unnecessary commas
     return ' '.join(cleaned_sentences)
 
 def generate_answer(question, context):
@@ -220,6 +207,7 @@ Question: {question}
 
 Answer:"""
 
+    model, tokenizer = get_model()
     inputs = tokenizer([input_text], max_length=1024, return_tensors="pt", truncation=True)
     
     with torch.no_grad():
@@ -248,18 +236,15 @@ Answer:"""
 def extract_relevant_sentences(question, context, num_sentences=2):
     sentences = sent_tokenize(context)
     
-    # Preprocess
     stop_words = set(stopwords.words('english'))
     question_words = [w.lower() for w in word_tokenize(question) if w.lower() not in stop_words]
     
-    # Score sentences
     scores = []
     for sentence in sentences:
         words = [w.lower() for w in word_tokenize(sentence) if w.lower() not in stop_words]
         score = sum(1 for w in question_words if w in words)
         scores.append(score)
     
-    # Get top sentences
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:num_sentences]
     top_sentences = [sentences[i] for i in sorted(top_indices)]
     
@@ -274,24 +259,21 @@ def remove_repetitions(text):
     return '. '.join(unique_sentences) + '.'
 
 def hybrid_context_retrieval(query, contexts, top_k=7, tfidf_weight=0.4):
-    # TF-IDF
     vectorizer = TfidfVectorizer(stop_words='english')
     tfidf_matrix = vectorizer.fit_transform([query] + contexts)
     tfidf_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
     
-    # Semantic Similarity
     query_embedding = retriever.encode([query])
     context_embeddings = retriever.encode(contexts)
     semantic_scores = cosine_similarity(query_embedding, context_embeddings)[0]
     
-    # Combine scores
-    combined_scores = 0.5 * tfidf_scores + 0.5 * semantic_scores
+    combined_scores = tfidf_weight * tfidf_scores + (1 - tfidf_weight) * semantic_scores
     
     top_indices = combined_scores.argsort()[-top_k:][::-1]
     return [contexts[i] for i in top_indices]
 
 def get_context(task, video_id, max_contexts=20, is_summarization=False):
-    global pinecone_index
+    pinecone_index = get_pinecone_index()
     namespace = f"video_{video_id}"
     
     print(f"Retrieving context for video_id: {video_id}, task: {task}, is_summarization: {is_summarization}")
@@ -308,7 +290,7 @@ def get_context(task, video_id, max_contexts=20, is_summarization=False):
         query_embedding = retriever.encode([task]).tolist()
         query_response = pinecone_index.query(
             vector=query_embedding[0], 
-            top_k=max_contexts * 2,  # Retrieve more contexts for hybrid method
+            top_k=max_contexts * 2,
             include_metadata=True, 
             namespace=namespace
         )
@@ -319,10 +301,9 @@ def get_context(task, video_id, max_contexts=20, is_summarization=False):
         contexts = [f"{match['metadata']['metadata_context']}\n{match['metadata']['chunk_text']}" for match in query_response['matches']]
         
         if not is_summarization:
-            # Apply hybrid context retrieval
             contexts = hybrid_context_retrieval(task, contexts, top_k=max_contexts)
         
-        print(f"First context: {contexts[0][:100]}...")  # Print first 100 chars of first context
+        print(f"First context: {contexts[0][:100]}...")
         return contexts
     return []
 
@@ -331,14 +312,12 @@ def extract_key_topics(title, description):
     words = re.findall(r'\w+', text)
     word_counts = Counter(words)
     
-    # Extract most common words (excluding stop words)
     stop_words = set(stopwords.words('english'))
     key_topics = [word for word, count in word_counts.most_common(5) if word not in stop_words]
     
     return key_topics
 
 def abstractive_summarize(text, key_topics, max_length=150, min_length=50):
-    # Prepend key topics to the text to encourage their inclusion in the summary
     topic_text = " ".join(key_topics)
     full_text = f"{topic_text}. {text}"
     
@@ -358,35 +337,28 @@ def abstractive_summarize(text, key_topics, max_length=150, min_length=50):
     summary = summarization_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
     return summary
 
-def reorder_sentences(sentences):
-    # Simple reordering: put shorter, more general sentences first
-    return sorted(sentences, key=len)
-
 def add_transitions(sentences):
     transitions = [
         "Additionally, ", "Furthermore, ", "Moreover, ", "In addition, ",
         "Also, ", "Besides this, ", "What's more, "
     ]
     for i in range(1, len(sentences)):
-        if random.random() < 0.3:  # 30% chance to add a transition
+        if random.random() < 0.3:
             sentences[i] = random.choice(transitions) + sentences[i][0].lower() + sentences[i][1:]
     return sentences
 
 def fix_capitalization(text):
-    # Capitalize the first letter of each sentence
     sentences = sent_tokenize(text)
     capitalized_sentences = [s.capitalize() for s in sentences]
     
-    # Join sentences
     text = ' '.join(capitalized_sentences)
     
-    # Capitalize proper nouns
     words = word_tokenize(text)
     tagged = pos_tag(words)
     
     capitalized_words = []
     for word, tag in tagged:
-        if tag.startswith('NNP'):  # Proper noun
+        if tag.startswith('NNP'):
             capitalized_words.append(word.capitalize())
         else:
             capitalized_words.append(word)
@@ -394,31 +366,20 @@ def fix_capitalization(text):
     return ' '.join(capitalized_words)
 
 def post_process_summary(summary, key_topics):
-    # Remove any mention of "Video title:" and the actual title
     summary = re.sub(r'Video title:.*?\.\s*', '', summary, flags=re.IGNORECASE)
     
-    # Split the summary into sentences
     sentences = sent_tokenize(summary)
     
-    # Remove any sentences that are too short (likely fragments)
     sentences = [s for s in sentences if len(s.split()) > 5]
     
-    # Reorder sentences for better flow
-    sentences = reorder_sentences(sentences)
-    
-    # Add transitions
     sentences = add_transitions(sentences)
     
-    # Join sentences
     processed_summary = ' '.join(sentences)
     
-    # Fix capitalization
     processed_summary = fix_capitalization(processed_summary)
 
-    # Remove any blank spaces before periods
     processed_summary = re.sub(r'\s+\.', '.', processed_summary)
 
-    # Remove any blank spaces before commas
     processed_summary = re.sub(r'\s+,', ',', processed_summary)
     
     return processed_summary
@@ -435,22 +396,18 @@ def summarize_video(max_summary_length=250):
             print("No contexts retrieved for summarization")
             return "Insufficient information to summarize the video content."
         
-        # Extract video title and description (for key topics, not for inclusion in summary)
         video_info = contexts[0].split('\n', 1)
         video_title = video_info[0].replace("Video Title: ", "")
         video_description = video_info[1] if len(video_info) > 1 else ""
         
-        # Extract key topics
         key_topics = extract_key_topics(video_title, video_description)
         
         print(f"Number of contexts for summarization: {len(contexts)}")
         all_text = " ".join(contexts)
         print(f"Total text length for summarization: {len(all_text)}")
         
-        # Summarize with key topics
         final_summary = abstractive_summarize(all_text, key_topics, max_length=max_summary_length, min_length=100)
         
-        # Post-process the summary
         final_summary = post_process_summary(final_summary, key_topics)
         
         print(f"Generated summary: {final_summary}")
@@ -465,7 +422,6 @@ def summarize_video(max_summary_length=250):
 def determine_task(user_input):
     print(f"Determining task for input: {user_input}")
     
-    # List of phrases that indicate a summary request
     summary_phrases = [
         "summarize", "summary", "summarize the video", 
         "what is this video about", "what is the video about", "what is the main topic of the video",
@@ -473,11 +429,9 @@ def determine_task(user_input):
         "overview", "main points", "key points", "main idea", "what is the video discussing"
     ]
     
-    # Check if the user input contains any of the summary phrases
     if any(phrase in user_input.lower() for phrase in summary_phrases):
         task_type = "summarization"
     else:
-        # If not a summary request, assume it's a specific question
         task_type = "question_answering"
     
     print(f"Determined task type: {task_type}")
@@ -488,7 +442,7 @@ def index():
     return render_template('index.html')
 
 def clear_pinecone_index():
-    global pinecone_index
+    pinecone_index = get_pinecone_index()
     try:
         stats_before = pinecone_index.describe_index_stats()
         print(f"Index stats before clearing: {stats_before}")
@@ -503,43 +457,25 @@ def clear_pinecone_index():
     except Exception as e:
         print(f"Error clearing Pinecone index: {str(e)}")
 
-def check_relevance(question, answer, context):
-    try:
-        relevance_prompt = f"""
-        Question: {question}
-        Answer: {answer}
-        Context: {context[:500]}  # Limit context length
-
-        Is the answer relevant to the question and based on the given context? Respond with Yes or No.
-        """
-        relevance_check = local_llm(relevance_prompt)
-        return relevance_check.strip().lower() == "yes"
-    except Exception as e:
-        print(f"Error in check_relevance: {str(e)}")
-        return True  # Assume relevance if there's an error
-
 @app.route('/process_video', methods=['POST'])
 def process_video():
-    global pinecone_index, current_video_id
+    global current_video_id
+    pinecone_index = get_pinecone_index()
 
     clear_pinecone_index()
     
     video_url = request.json['video_url']
     try:
-        video_id = video_url.split('v=')[1].split('&')[0]  # This will handle URLs with additional parameters
+        video_id = video_url.split('v=')[1].split('&')[0]
         current_video_id = video_id
         print(f"Processing video with ID: {current_video_id}")
     except IndexError:
         return jsonify({"error": "Invalid YouTube URL"}), 400
     
     try:
-        # Process the video
         video_data, video_info = preprocess_video(video_id)
-        
-        # Convert to DataFrame
         df = pd.DataFrame(video_data)
         
-        # Upsert to Pinecone
         batch_size = 100
         total_upserted = 0
         for i in tqdm(range(0, len(df), batch_size)):
@@ -552,12 +488,9 @@ def process_video():
                 for vec, (_, row) in zip(emb, batch.iterrows())
             ]
             
-            #print(f"Sample upsert data: {upsert_data[:2]}")
-            
             try:
                 namespace = f"video_{video_id}"
                 upsert_response = pinecone_index.upsert(vectors=upsert_data, namespace=namespace)
-                #upsert_response = pinecone_index.upsert(vectors=upsert_data)
                 print(f"Upsert response for batch {i//batch_size + 1}: {upsert_response}")
                 total_upserted += upsert_response['upserted_count']
             except Exception as e:
@@ -567,11 +500,10 @@ def process_video():
 
         print(f"Total vectors upserted: {total_upserted}")
 
-        # Check if data was inserted successfully
         time.sleep(5)
         stats = pinecone_index.describe_index_stats()
-        namespace_stats = stats['namespaces'].get(namespace, {})
-        print(f"Namespace '{namespace}' stats: {namespace_stats}")
+        namespace_stats = stats['namespaces'].get(f"video_{video_id}", {})
+        print(f"Namespace 'video_{video_id}' stats: {namespace_stats}")
 
         if stats['total_vector_count'] != total_upserted:
             print(f"Warning: Mismatch between upserted count ({total_upserted}) and total vector count ({stats['total_vector_count']})")
@@ -593,20 +525,9 @@ def process_video():
         print(f"Traceback: {error_traceback}")
         return jsonify({"error": str(e), "traceback": error_traceback}), 500
 
-def check_relevance(question, answer, context):
-    relevance_prompt = f"""
-    Question: {question}
-    Answer: {answer}
-    Context: {context[:500]}
-
-    Is the answer relevant to the question and based on the given context? Respond with Yes or No.
-    """
-    relevance_check = local_llm(relevance_prompt)
-    return relevance_check.strip().lower() == "yes"
-
 @app.route('/chat', methods=['POST'])
 def chat():
-    global pinecone_index, current_video_id
+    global current_video_id
     
     user_message = request.json['message'].strip()
     print(f"Received user message: {user_message}")
@@ -630,7 +551,7 @@ def chat():
                 response = ["I don't have specific information to answer that question based on the video content."]
             else:
                 combined_context = " ".join(contexts)
-                print(f"Combined context: {combined_context[:500]}...")  # Print first 500 characters of context
+                print(f"Combined context: {combined_context[:500]}...")
                 answer = generate_answer(user_message, combined_context)
                 response = answer
             
@@ -645,8 +566,9 @@ def chat():
         print(f"Error in chat: {str(e)}")
         print(f"Traceback: {error_traceback}")
         return jsonify({"error": str(e), "traceback": error_traceback}), 400
-
+    finally:
+        unload_model()
+        unload_pinecone()
+        
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=os.getenv("PORT", default=5000))
-
-

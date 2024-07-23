@@ -1,8 +1,9 @@
-flask
+Flask==2.3.2
 python-dotenv
 yt-dlp
 youtube_transcript_api
 langchain
+langchain-community
 pandas
 tqdm
 sentence-transformers
@@ -10,3 +11,4 @@ pinecone-client
 torch
 transformers
 peft
+nltk

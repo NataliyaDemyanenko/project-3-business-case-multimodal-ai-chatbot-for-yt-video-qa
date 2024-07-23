@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project implements a multimodal AI ChatBot capable of summarizing YouTube videos and answering questions about their content. The chatbot uses advanced natural language processing techniques to provide accurate and coherent responses to user queries.
+This project implements a multimodal AI ChatBot based on open-source large language models capable of summarizing YouTube videos and answering questions about their content. The chatbot uses advanced natural language processing techniques to provide accurate and coherent responses to user queries.
 
 ### Key Features
 
@@ -14,8 +14,6 @@ This project implements a multimodal AI ChatBot capable of summarizing YouTube v
 
 ## Repository Structure
 
-- `Report.pdf`: Detailed project report
-- `Final project presentation.pdf`: Project presentation slides
 - `Deployment/`: Folder containing the final app suitable for external hosting
   - `app.py`: Main application file
   - `templates/`: Folder containing HTML templates
